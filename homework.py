@@ -4,11 +4,12 @@ import os
 import time
 import requests
 import telegram
-
+from http import HTTPStatus
+from exceptions import WrongResponseCode, NotForSend, UnknownStatusError
 from dotenv import load_dotenv
 
-load_dotenv()
 
+load_dotenv()
 
 PRACTICUM_TOKEN = os.getenv('PRACTICUM_TOKEN')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
@@ -24,10 +25,6 @@ HOMEWORK_VERDICTS = {
     'reviewing': 'Работа взята на проверку ревьюером.',
     'rejected': 'Работа проверена: у ревьюера есть замечания.'
 }
-
-
-class RequestExceptionError(Exception):
-    """Ошибка запроса."""
 
 
 def get_stream_handler():
@@ -52,40 +49,35 @@ def log_and_send_error_to_Telegram(bot, message):
 
 def check_tokens() -> bool:
     """Проверка наличия ключей."""
-    if not PRACTICUM_TOKEN:
-        logger.critical('Отсутствует обязательная переменная PRACTICUM_TOKEN')
-    elif not TELEGRAM_TOKEN:
-        logger.critical('Отсутствует обязательная переменная TELEGRAM_TOKEN')
-    elif not TELEGRAM_CHAT_ID:
-        logger.critical(
-            'Отсутствует обязательная переменная TELEGRAM_CHAT_ID')
-    else:
-        logger.debug('Проверка ключей проведена')
-    return PRACTICUM_TOKEN and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID
+    logging.info('Проверка наличия всех токенов')
+    return all([PRACTICUM_TOKEN, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID])
 
 
 def get_api_answer(timestamp):
     """Направление запроса и получение ответа."""
     timestamp = timestamp or int(time.time())
-    params = {'from_date': timestamp}
+    request_params = {
+        'url': ENDPOINT,
+        'headers': HEADERS,
+        'params': {'from_date': timestamp},
+    }
+    message = ('Начало запроса к API. Запрос: {url}, {headers}, {params}.'
+               ).format(**request_params)
+    logging.info(message)
     try:
-        response = requests.get(ENDPOINT, headers=HEADERS, params=params)
-        if response.status_code != 200:
-            raise Exception(f'Сбой при обращении к URL {response.request.url}'
-                            f'; код ответа: {response.status_code} - '
-                            f'{response.reason}; параметры: {params}')
-        logger.debug('Ответ от сервера получен')
-        response = response.json()
-    except requests.exceptions.RequestException as request_error:
-        code_api_msg = f'Код ответа API (RequestException): {request_error}'
-        logger.error(code_api_msg)
-        raise RequestExceptionError(code_api_msg) from request_error
-    except TypeError:
-        raise Exception(
-            'Ответ от сервера не соответствует формату JSON'
-            'и не может быть обработан'
-        )
-    return response
+        response = requests.get(**request_params)
+        if response.status_code != HTTPStatus.OK:
+            raise WrongResponseCode(
+                f'Ответ API не возвращает 200. '
+                f'Код ответа: {response.status_code}. '
+                f'Причина: {response.reason}. '
+                f'Текст: {response.text}.'
+            )
+        return response.json()
+    except Exception as error:
+        message = ('API не возвращает 200. Запрос: {url}, {headers}, {params}.'
+                   ).format(**request_params)
+        raise WrongResponseCode(message, error)
 
 
 def check_response(response):
@@ -136,7 +128,7 @@ def parse_status(homework):
     """Определение статуса работы."""
     homework_name = homework.get("homework_name")
     homework_status = homework.get("status")
-    verdict = HOMEWORK_VERDICTS.get(homework.get('status'))
+    verdict = HOMEWORK_VERDICTS.get(homework.get("status"))
     if homework_status not in HOMEWORK_VERDICTS:
         message_homework_status = "Такого статуса не существует"
         raise KeyError(message_homework_status)
@@ -148,9 +140,15 @@ def parse_status(homework):
             'Отсутствует документированный статус'
             f'проверки работы "{homework_name}"'
         )
+    if homework is None:
+        raise UnknownStatusError(
+            f'Неизвестный статус "{homework_status}" '
+            f'у работы "{homework_name}"')
     message = (
-        'Изменился статус проверки работы'
-        f' "{homework_name}".\n{verdict}'
+        'Изменился статус проверки работы "{homework_name}". {verdict}'
+    ).format(
+        homework_name=homework_name,
+        verdict=HOMEWORK_VERDICTS[homework_status]
     )
     return message
 
@@ -169,35 +167,56 @@ def send_message(bot, message):
 def main():
     """Основная логика работы бота."""
     if not check_tokens():
-        sys.exit('Проблемы с токенами! Выход из программы')
-    prior_hw, prior_error, prior_message = {}, '', ''
+        message = 'Отсутствует токен. Бот остановлен!'
+        logging.critical(message)
+        sys.exit(message)
     bot = telegram.Bot(token=TELEGRAM_TOKEN)
-    timestamp = int(time.time()) - 30 * 24 * 60 * 60
+    timestamp = int(time.time())
+    start_message = 'Бот начал работу'
+    send_message(bot, start_message)
+    logging.info(start_message)
+    prev_msg = ''
+
     while True:
         try:
-            api_answer = get_api_answer(timestamp)
-            hw = check_response(api_answer)
-            if len(hw) == 0:
-                hw = prior_hw
-            if hw != prior_hw:
-                message = parse_status(hw[0])
-                if message != prior_message:
-                    send_message(bot, message)
-                    prior_message = message
-                prior_hw = hw
+            response = get_api_answer(timestamp)
+            timestamp = response.get(
+                'current_date', int(time.time())
+            )
+            homeworks = check_response(response)
+            if homeworks:
+                message = parse_status(homeworks[0])
             else:
-                logger.debug(
-                    'Сообщение в Телеграм не отправлено, обновлений нет'
-                )
-            timestamp = api_answer['current_date']
+                message = 'Нет новых статусов'
+            if message != prev_msg:
+                send_message(bot, message)
+                prev_msg = message
+            else:
+                logging.info(message)
+
+        except NotForSend as error:
+            message = f'Сбой в работе программы: {error}'
+            logging.error(message, exc_info=True)
+
         except Exception as error:
-            if str(error) == prior_error:
-                logger.error(error)
-            else:
-                log_and_send_error_to_Telegram(bot=bot, message=error)
-                prior_error = str(error)
-        time.sleep(RETRY_PERIOD)
+            message = f'Сбой в работе программы: {error}'
+            logging.error(message, exc_info=True)
+            if message != prev_msg:
+                send_message(bot, message)
+                prev_msg = message
+
+        finally:
+            time.sleep(RETRY_PERIOD)
 
 
 if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[
+            logging.FileHandler(
+                os.path.abspath('main.log'), mode='a', encoding='UTF-8'),
+            logging.StreamHandler(stream=sys.stdout)],
+        format='%(asctime)s, %(levelname)s, %(funcName)s, '
+               '%(lineno)s, %(name)s, %(message)s'
+    )
     main()
